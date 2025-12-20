@@ -1,0 +1,4 @@
+date*,amount*,name,currency,category,tags,account,notes
+2025-12-15,-45.99,Grocery Store,IDR,Food,groceries|essentials,Checking Account,Monthly grocery run
+2025-12-16,1500.00,Salary,IDR,Income,,Main Account,
+2025-12-17,-12.50,Coffee Shop,IDR,,coffee,,
