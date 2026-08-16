@@ -33,7 +33,7 @@ class TestSureImporterDedup:
             {"date": "", "signed_amount_cents": 0, "name": "No date"},
         ]
         keys = SureImporter.existing_keys(tx)
-        assert ("2026-08-01", 15000000, "SHOPEE PAY") in keys
+        assert ("2026-08-01", 15000000, "SHOPEEPAY") in keys
         assert ("2026-08-02", 500000000, "SALARY") in keys
         # Empty date / zero amount rows are excluded from the key set.
         assert len(keys) == 2
@@ -59,6 +59,24 @@ class TestSureImporterDedup:
         importer = SureImporter(api_key="test")
         rows = [{"date": "2026-08-05", "amount": "-50000.0", "name": "ATM WITHDRAWAL"}]
         existing = [{"date": "2026-08-05", "signed_amount_cents": -5000000, "name": "atm withdrawal"}]
+        new_rows, dupes = importer.split_rows(rows, existing)
+        assert new_rows == []
+        assert len(dupes) == 1
+
+    def test_split_rows_whitespace_variant_name_match(self):
+        # Regression: old imports stored 'Pembayaran QRke ...' (newline stripped,
+        # no space) while the converter now keeps 'Pembayaran QR\\nke ...'. Both
+        # are the SAME transaction — dedup must catch it (2026-08-17 incident:
+        # 9 duplicates imported because 'QRke' vs 'QR KE' mismatched).
+        importer = SureImporter(api_key="test")
+        rows = [{
+            "date": "2025-09-12", "amount": "-150000.0",
+            "name": "Pembayaran QR\nke PPPSRS THE JARDIN APPARTE\n509125378058",
+        }]
+        existing = [{
+            "date": "2025-09-12", "signed_amount_cents": -15000000,
+            "name": "Pembayaran QRke PPPSRS THE JARDIN APPARTE509125378058",
+        }]
         new_rows, dupes = importer.split_rows(rows, existing)
         assert new_rows == []
         assert len(dupes) == 1

@@ -58,6 +58,17 @@ def normalize_name(name: str) -> str:
     return _WS_RE.sub(" ", str(name or "").strip().upper())
 
 
+def dedup_name(name: str) -> str:
+    """Dedup-key name: uppercase with ALL whitespace removed.
+
+    Existing Sure rows are stored with inconsistent whitespace (some imports
+    strip newlines entirely, e.g. 'Pembayaran QRke ...' vs 'Pembayaran QR\\nke
+    ...'). Collapsing to a single space is NOT enough — 'QRke' vs 'QR KE'
+    still differ. Removing all whitespace makes both match.
+    """
+    return _WS_RE.sub("", str(name or "").upper())
+
+
 def amount_to_cents(amount: float) -> int:
     """Convert a float amount (Rupiah) to integer cents (amount x 100)."""
     return int(round(abs(float(amount)) * 100))
@@ -193,7 +204,7 @@ class SureImporter:
         for tx in transactions:
             date = (tx.get("date") or "").strip()
             cents = abs(int(tx.get("signed_amount_cents") or tx.get("amount_cents") or 0))
-            name = normalize_name(tx.get("name") or "")
+            name = dedup_name(tx.get("name") or "")
             if date and cents:
                 keys.add((date, cents, name))
         return keys
@@ -213,7 +224,7 @@ class SureImporter:
                 amount = 0.0
             if not date or amount == 0:
                 continue  # not importable; silently drop
-            key = (date, amount_to_cents(amount), normalize_name(row.get("name") or ""))
+            key = (date, amount_to_cents(amount), dedup_name(row.get("name") or ""))
             (dupes if key in keys else new_rows).append(row)
         return new_rows, dupes
 
