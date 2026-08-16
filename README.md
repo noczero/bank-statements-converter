@@ -9,6 +9,8 @@ A Python tool for converting bank statements from various formats (Excel) into a
 - 📊 **Standardized output** - Exports to a consistent format for easy import
 - 🔄 **Batch processing** - Converts all files in a folder at once
 - ⏭️ **Skip existing** - Automatically skips already-converted files
+- 💸 **Sure Finance import** - Imports converted statements into Sure
+  (finance.zeroinside.id) via its native CSV import API, with dedup + auto-categorization
 
 ## Requirements
 
@@ -101,10 +103,12 @@ date*,amount*,name,currency,category,tags,account,notes
 ```
 bank-statement-converter/
 ├── main.py                     # Entry point
+├── sure_import_statement.py    # Convert + import into Sure Finance (CLI)
 ├── src/
 │   ├── __init__.py
 │   ├── base_bank_statement_converter.py    # Abstract base class
-│   └── mandiri_bank_statement_converter.py # Mandiri implementation
+│   ├── mandiri_bank_statement_converter.py # Mandiri implementation
+│   └── sure_importer.py                    # Sure Finance API client (import/dedup/categorize)
 ├── tests/
 │   ├── test_base_bank_statement_converter.py
 │   └── test_mandiri_bank_statement_converter.py
@@ -158,6 +162,42 @@ pytest --cov=src --cov-report=term-missing
 2. Add the converter to `main.py`
 3. Create a folder `bank-statements/newbank/`
 4. Add tests in `tests/`
+
+## Sure Finance Import
+
+Convert a Mandiri statement and push it straight into Sure (the user's self-hosted
+ledger at finance.zeroinside.id) with one command. The pipeline:
+
+1. **Convert** the Excel statement to CSV (`MandiriBankStatementConverter`)
+2. **Dedup** against existing Sure transactions in the statement's date range
+   (date + amount + name) — re-running a monthly statement is a no-op
+3. **Import** via Sure's native CSV import API (`POST /imports`, `TransactionImport`,
+   `publish=true`) — the same pipeline the app's UI uses, so rows are validated and
+   created by a background job
+4. **Auto-categorize** (optional) using a regex taxonomy on the transaction name
+   (BPJS→Insurance, Shopee/Tokopedia→Shopping, bank fees→Fees, salary→Salary, ...)
+
+```bash
+# Preview only — converts and shows what would be imported, no writes
+python sure_import_statement.py bank-statements/mandiri/statement.xlsx --dry-run
+
+# Full import + auto-categorize
+python sure_import_statement.py bank-statements/mandiri/statement.xlsx --categorize
+
+# Create the import without publishing (review in the app first, publish there)
+python sure_import_statement.py statement.xlsx --no-publish
+```
+
+Environment (see `.env.example`):
+
+| Variable | Purpose |
+|---|---|
+| `MANDIRI_BANK_STATEMENT_PASSWORD` | Password for the encrypted Mandiri Excel |
+| `SURE_API_KEY` | Sure REST API key (`X-Api-Key` header) |
+| `SURE_BASE_URL` | Default `https://finance.zeroinside.id/api/v1` |
+
+`SURE_API_KEY` falls back to `~/.hermes/.env` if not set (the Hermes-managed
+secrets file), so the agent can run imports without extra setup.
 
 ## License
 
