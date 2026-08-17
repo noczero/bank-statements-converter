@@ -69,6 +69,16 @@ def dedup_name(name: str) -> str:
     return _WS_RE.sub("", str(name or "").upper())
 
 
+def display_name(name: str) -> str:
+    """User-facing name: collapse ALL whitespace (incl. newlines) to single spaces.
+
+    The Sure backend's CSV import strips embedded newlines WITHOUT replacing
+    them ('Pembayaran QR\\nke X\\n608...' -> 'Pembayaran QRke X608...'), so
+    multi-line names must be flattened to spaces before sending.
+    """
+    return _WS_RE.sub(" ", str(name or "").strip())
+
+
 def amount_to_cents(amount: float) -> int:
     """Convert a float amount (Rupiah) to integer cents (amount x 100)."""
     return int(round(abs(float(amount)) * 100))

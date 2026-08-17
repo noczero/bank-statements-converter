@@ -41,6 +41,7 @@ from src.sure_importer import (
     DEFAULT_BASE_URL,
     SureAPIError,
     SureImporter,
+    display_name,
 )
 
 CSV_COLUMNS = ["date", "amount", "name"]
@@ -66,7 +67,9 @@ def normalize_csv(csv_path: str) -> str:
     df = df[CSV_COLUMNS].copy()
     df["date"] = df["date"].fillna("").str.strip()
     df["amount"] = pd.to_numeric(df["amount"].str.replace(",", "", regex=False), errors="coerce")
-    df["name"] = df["name"].fillna("").str.strip()
+    # Flatten multi-line names to single spaces: Sure's import strips embedded
+    # newlines without replacing them ("QR\nke X\n608" -> "QRke X608").
+    df["name"] = df["name"].fillna("").map(display_name)
     df = df.dropna(subset=["amount"])
     df = df[df["amount"] != 0]
 

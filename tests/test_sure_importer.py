@@ -158,3 +158,20 @@ class TestSureImporterApi:
         monkeypatch.setattr(importer, "_request", fake_request)
         result = importer.get_transactions(account_id="acc-1")
         assert [t["id"] for t in result] == ["a", "b"]
+
+    def test_display_name_flattens_multiline_names(self):
+        # Regression: Sure's backend strips embedded newlines without replacing
+        # them ('Pembayaran QR\nke X\n608...' -> 'Pembayaran QRke X608...'), so
+        # the pipeline must flatten multi-line names to single spaces first.
+        from src.sure_importer import display_name
+
+        assert (
+            display_name("Pembayaran QR\nke CAFFE EDELWIS\n608544838726")
+            == "Pembayaran QR ke CAFFE EDELWIS 608544838726"
+        )
+        assert (
+            display_name("Transfer BI Fast\nKe BSI\nNURMIATI QQ RADIFAH 7103833633")
+            == "Transfer BI Fast Ke BSI NURMIATI QQ RADIFAH 7103833633"
+        )
+        assert display_name("  Biaya transfer BI Fast  ") == "Biaya transfer BI Fast"
+        assert display_name("") == ""
