@@ -222,7 +222,37 @@ class SureImporter:
     def split_rows(
         self, rows: List[dict], existing: List[dict]
     ) -> Tuple[List[dict], List[dict]]:
-        """Split converted CSV rows into (new_rows, duplicates) vs existing tx."""
+        """Split converted CSV rows into (new_rows, duplicates) vs existing tx.
+
+        Two layers: (1) exact (date, |amount|, whitespace-stripped NAME) keys,
+        (2) an email-anchor fallback — existing transactions carrying an
+        "Email ref:" note were created from Mandiri email notifications and
+        may have a different name than the statement row (e.g. 'DINA AYU
+        SYAHPITRI HASIB' vs the bank-truncated 'DINA AYU SYAHPITRI H'). If
+        enough email-created tx cover all statement rows for a (date, amount)
+        key, the rows are duplicates. The count guard keeps two same-day
+        same-amount payments (e.g. two -500.000 transfers) from being wrongly
+        collapsed.
+        """
+        email_anchor: Dict[Tuple[str, int], int] = {}
+        for tx in existing:
+            if "email ref:" in (tx.get("notes") or "").lower():
+                date = (tx.get("date") or "").strip()
+                cents = abs(int(tx.get("signed_amount_cents") or tx.get("amount_cents") or 0))
+                if date and cents:
+                    email_anchor[(date, cents)] = email_anchor.get((date, cents), 0) + 1
+
+        batch_count: Dict[Tuple[str, int], int] = {}
+        for row in rows:
+            date = str(row.get("date") or "").strip()
+            try:
+                amount = float(row.get("amount") or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if date and amount:
+                key = (date, amount_to_cents(amount))
+                batch_count[key] = batch_count.get(key, 0) + 1
+
         keys = self.existing_keys(existing)
         new_rows: List[dict] = []
         dupes: List[dict] = []
@@ -234,8 +264,12 @@ class SureImporter:
                 amount = 0.0
             if not date or amount == 0:
                 continue  # not importable; silently drop
+            dc = (date, amount_to_cents(amount))
             key = (date, amount_to_cents(amount), dedup_name(row.get("name") or ""))
-            (dupes if key in keys else new_rows).append(row)
+            email_dupe = (
+                dc in email_anchor and batch_count.get(dc, 0) <= email_anchor[dc]
+            )
+            (dupes if (key in keys or email_dupe) else new_rows).append(row)
         return new_rows, dupes
 
     # -- Classification ---------------------------------------------------

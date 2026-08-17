@@ -81,6 +81,46 @@ class TestSureImporterDedup:
         assert new_rows == []
         assert len(dupes) == 1
 
+    def test_split_rows_email_anchor_fallback(self):
+        # Regression: email-created tx carry an "Email ref:" note and a
+        # different name than the statement row ('DINA AYU SYAHPITRI HASIB'
+        # vs the bank-truncated 'DINA AYU SYAHPITRI H'). The statement row
+        # must be treated as a duplicate (email automation 2026-08-17).
+        importer = SureImporter(api_key="test")
+        rows = [{
+            "date": "2026-08-13", "amount": "-1100000.0",
+            "name": "Transfer BI Fast Ke BCA DINA AYU SYAHPITRI H 613624578",
+        }]
+        existing = [{
+            "date": "2026-08-13", "signed_amount_cents": -110000000,
+            "name": "Transfer BI Fast Ke BCA DINA AYU SYAHPITRI HASIB 0613624578",
+            "notes": "Email ref: 20260813BMRIIDJA010O0224743457 (msgid)",
+        }]
+        new_rows, dupes = importer.split_rows(rows, existing)
+        assert new_rows == []
+        assert len(dupes) == 1
+
+    def test_split_rows_email_anchor_count_guard(self):
+        # Two same-day same-amount transfers (e.g. PAINO/SYAMSINAR -500.000)
+        # where only ONE was email-created: the second statement row is NOT a
+        # duplicate and must be imported.
+        importer = SureImporter(api_key="test")
+        rows = [
+            {"date": "2026-07-29", "amount": "-500000.0",
+             "name": "Transfer ke BANK MANDIRI PAINO 1050014083699"},
+            {"date": "2026-07-29", "amount": "-500000.0",
+             "name": "Transfer ke BANK MANDIRI SYAMSINAR 1050012558668"},
+        ]
+        existing = [{
+            "date": "2026-07-29", "signed_amount_cents": -50000000,
+            "name": "Transfer ke BANK MANDIRI PAINO 1050014083699",
+            "notes": "Email ref: 260729123 (msgid)",
+        }]
+        new_rows, dupes = importer.split_rows(rows, existing)
+        assert len(dupes) == 1  # PAINO covered by email anchor
+        assert len(new_rows) == 1
+        assert new_rows[0]["name"] == "Transfer ke BANK MANDIRI SYAMSINAR 1050012558668"
+
 
 class TestSureImporterClassify:
     @pytest.mark.parametrize(
