@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a Mandiri bank statement (.xlsx) and import it into Sure Finance.
+"""Convert a Mandiri bank statement (.xlsx or .pdf) and import it into Sure Finance.
 
 Pipeline:
     1. Convert the (optionally password-protected) Excel statement to CSV
@@ -18,9 +18,6 @@ Examples:
     # Preview only (no writes to Sure)
     python sure_import_statement.py bank-statements/mandiri/statement.xlsx --dry-run
 
-    # Convert + import + auto-categorize using the known taxonomy
-    python sure_import_statement.py bank-statements/mandiri/statement.xlsx --categorize
-
     # Import without auto-publishing (reviewable in the app, then publish)
     python sure_import_statement.py statement.xlsx --no-publish
 """
@@ -36,11 +33,13 @@ from typing import List, Optional
 import pandas as pd
 from dotenv import load_dotenv
 
+from src import mandiri_pdf_statement
 from src.mandiri_bank_statement_converter import MandiriBankStatementConverter
 from src.sure_importer import (
     DEFAULT_BASE_URL,
     SureAPIError,
     SureImporter,
+    display_name,
 )
 
 CSV_COLUMNS = ["date", "amount", "name"]
@@ -66,7 +65,9 @@ def normalize_csv(csv_path: str) -> str:
     df = df[CSV_COLUMNS].copy()
     df["date"] = df["date"].fillna("").str.strip()
     df["amount"] = pd.to_numeric(df["amount"].str.replace(",", "", regex=False), errors="coerce")
-    df["name"] = df["name"].fillna("").str.strip()
+    # Flatten multi-line names to single spaces: Sure's import strips embedded
+    # newlines without replacing them ("QR\nke X\n608" -> "QRke X608").
+    df["name"] = df["name"].fillna("").map(display_name)
     df = df.dropna(subset=["amount"])
     df = df[df["amount"] != 0]
 
@@ -88,12 +89,11 @@ def pick_account(importer: SureImporter, name: str) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("statement", help="Path to the Mandiri .xlsx bank statement")
+    parser.add_argument("statement", help="Path to the Mandiri .xlsx or .pdf bank statement")
     parser.add_argument("--dry-run", action="store_true", help="Convert + dedup only, no API writes")
     parser.add_argument("--no-publish", action="store_true", help="Create the import but don't publish")
-    parser.add_argument("--categorize", action="store_true", help="Auto-categorize imported tx (taxonomy)")
     parser.add_argument("--account", default="Mandiri", help="Sure account name to import into (default: Mandiri)")
-    parser.add_argument("--password", default=None, help="Excel password (overrides env)")
+    parser.add_argument("--password", default=None, help="Excel/PDF password (overrides env)")
     parser.add_argument("--api-key", default=None, help="Sure API key (overrides env)")
     parser.add_argument("--base-url", default=os.getenv("SURE_BASE_URL", DEFAULT_BASE_URL))
     args = parser.parse_args(argv)
@@ -106,7 +106,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 1. Convert ----------------------------------------------------------
     print(f"[1/4] Converting {args.statement} ...")
     converter = MandiriBankStatementConverter(password=args.password)
-    output_path = converter.convert_file(args.statement)
+    if args.statement.lower().endswith(".pdf"):
+        output_path = mandiri_pdf_statement.convert(
+            args.statement, converter.results_folder,
+            args.password or os.getenv("MANDIRI_BANK_STATEMENT_PASSWORD"),
+        )
+    else:
+        output_path = converter.convert_file(args.statement)
     if not output_path:
         print("  (already converted — reusing existing CSV)")
         output_path = os.path.join(
@@ -184,33 +190,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  rows imported={created} invalid={invalid}")
     print(f"\nDone. {len(new_rows)} statement row(s) imported into Sure ({args.account}).")
     print(f"Import record: https://finance.zeroinside.id/imports/{import_id}")
-
-    # 5. Optional categorization --------------------------------------------
-    if args.categorize and new_rows:
-        print("\nCategorizing imported transactions ...")
-        # Match back the created transactions by dedup key (date, cents, name).
-        keys = {
-            (r["date"].strip(), int(round(abs(float(r["amount"])) * 100)),
-             (r["name"] or "").strip().upper())
-            for r in new_rows
-        }
-        fresh = importer.get_transactions(
-            account_id=account_id, start_date=start_date, end_date=end_date
-        )
-        created_tx = [tx for tx in fresh if _tx_key(tx) in keys]
-        categories = importer.get_categories()
-        count, skipped = importer.categorize_transactions(created_tx, categories)
-        print(f"  categorized {count} transaction(s)")
-        for name in skipped:
-            print(f"  WARN: category '{name}' not found in Sure — skipped")
+    print("Sure's rules categorize the new rows after the import's sync.")
     return 0
-
-
-def _tx_key(tx: dict):
-    date = (tx.get("date") or "").strip()
-    cents = abs(int(tx.get("signed_amount_cents") or tx.get("amount_cents") or 0))
-    name = (tx.get("name") or "").strip().upper()
-    return (date, cents, name)
 
 
 def _to_csv(rows: List[dict]) -> str:

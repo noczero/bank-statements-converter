@@ -10,7 +10,7 @@ A Python tool for converting bank statements from various formats (Excel) into a
 - 🔄 **Batch processing** - Converts all files in a folder at once
 - ⏭️ **Skip existing** - Automatically skips already-converted files
 - 💸 **Sure Finance import** - Imports converted statements into Sure
-  (finance.zeroinside.id) via its native CSV import API, with dedup + auto-categorization
+  (finance.zeroinside.id) via its native CSV import API, with dedup; Sure's own rules categorize the imported rows
 
 ## Requirements
 
@@ -108,7 +108,7 @@ bank-statement-converter/
 │   ├── __init__.py
 │   ├── base_bank_statement_converter.py    # Abstract base class
 │   ├── mandiri_bank_statement_converter.py # Mandiri implementation
-│   └── sure_importer.py                    # Sure Finance API client (import/dedup/categorize)
+│   └── sure_importer.py                    # Sure Finance API client (import/dedup)
 ├── tests/
 │   ├── test_base_bank_statement_converter.py
 │   └── test_mandiri_bank_statement_converter.py
@@ -174,15 +174,15 @@ ledger at finance.zeroinside.id) with one command. The pipeline:
 3. **Import** via Sure's native CSV import API (`POST /imports`, `TransactionImport`,
    `publish=true`) — the same pipeline the app's UI uses, so rows are validated and
    created by a background job
-4. **Auto-categorize** (optional) using a regex taxonomy on the transaction name
-   (BPJS→Insurance, Shopee/Tokopedia→Shopping, bank fees→Fees, salary→Salary, ...)
+4. **Categorize**: publishing the import queues a family sync, which runs the
+   keyword rules kept in Sure (Settings → Rules). This repo has no taxonomy of its own.
 
 ```bash
 # Preview only — converts and shows what would be imported, no writes
 python sure_import_statement.py bank-statements/mandiri/statement.xlsx --dry-run
 
-# Full import + auto-categorize
-python sure_import_statement.py bank-statements/mandiri/statement.xlsx --categorize
+# Full import (Sure's rules categorize the rows)
+python sure_import_statement.py bank-statements/mandiri/statement.xlsx
 
 # Create the import without publishing (review in the app first, publish there)
 python sure_import_statement.py statement.xlsx --no-publish

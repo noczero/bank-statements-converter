@@ -6,8 +6,8 @@ Wraps the Sure REST API (https://finance.zeroinside.id/api/v1):
     (``POST /imports`` with ``type=TransactionImport`` + ``account_id`` +
     ``raw_file_content`` + column configuration + ``publish=true``). The import
     job runs async on the server; ``wait_import`` polls until terminal.
-2.  ``categorize_transactions`` -> PATCHes categories using a regex taxonomy
-    on the transaction name (bank fees, BPJS, Shopee, ...).
+2.  ``apply_rules`` -> queues a family sync so Sure's own rules categorize
+    new transactions (the keyword rules live in Sure, not here).
 
 Auth: header ``X-Api-Key`` (NOT Bearer). A browser User-Agent is required or
 the server returns 403.
@@ -28,22 +28,6 @@ USER_AGENT = "bank-statements-converter/1.0 (sure-import)"
 POLL_INTERVAL_S = 4
 POLL_TIMEOUT_S = 300
 
-# Category classification taxonomy — regexes matched against the UPPERCASED
-# transaction name. Order matters: bank-fee patterns first, then merchants.
-CATEGORY_RULES: List[Tuple[str, str]] = [
-    (r"BIAYA TRANSAKSI BANK|BIAYA ADMINISTRASI|BIAYA TRANSFER", "Fees"),
-    (r"BPJS KESEHATAN", "Insurance"),
-    (r"SALARY|GAJI", "Salary"),
-    (r"SAMSAT", "Taxes"),
-    (r"MESJID|QURBAN|ZAKAT|MASJID", "Gifts & Donations"),
-    (r"TRAVELOKA", "Travel"),
-    (r"SEABANK|SAQU INDONESIA", "Cash Out"),
-    (r"BANK RAKYAT INDONESIA", "Loan Payments"),
-    (r"SHOPEE|TOKOPEDIA", "Shopping"),
-    (r"SHOES AND CARE|RING SHOES CARE", "Shopping"),
-    (r"MARUGAME", "Food & Drink"),
-]
-
 # Mandiri bank statements carry 3rd-party info in the second row of each
 # transaction (e.g. "From: Company ABC"). The converter already drops those.
 _WS_RE = re.compile(r"\s+")
@@ -56,6 +40,27 @@ class SureAPIError(RuntimeError):
 def normalize_name(name: str) -> str:
     """Normalize a transaction name for dedup matching."""
     return _WS_RE.sub(" ", str(name or "").strip().upper())
+
+
+def dedup_name(name: str) -> str:
+    """Dedup-key name: uppercase with ALL whitespace removed.
+
+    Existing Sure rows are stored with inconsistent whitespace (some imports
+    strip newlines entirely, e.g. 'Pembayaran QRke ...' vs 'Pembayaran QR\\nke
+    ...'). Collapsing to a single space is NOT enough — 'QRke' vs 'QR KE'
+    still differ. Removing all whitespace makes both match.
+    """
+    return _WS_RE.sub("", str(name or "").upper())
+
+
+def display_name(name: str) -> str:
+    """User-facing name: collapse ALL whitespace (incl. newlines) to single spaces.
+
+    The Sure backend's CSV import strips embedded newlines WITHOUT replacing
+    them ('Pembayaran QR\\nke X\\n608...' -> 'Pembayaran QRke X608...'), so
+    multi-line names must be flattened to spaces before sending.
+    """
+    return _WS_RE.sub(" ", str(name or "").strip())
 
 
 def amount_to_cents(amount: float) -> int:
@@ -143,18 +148,6 @@ class SureImporter:
         )
         return accounts if isinstance(accounts, list) else []
 
-    def get_categories(self) -> Dict[str, str]:
-        """Return {category_name: uuid} from /categories."""
-        data = self._request("GET", "/categories")
-        items = (
-            data.get("categories")
-            or data.get("data")
-            or (data if isinstance(data, list) else [])
-        )
-        if not isinstance(items, list):
-            return {}
-        return {c.get("name"): c.get("id") for c in items if c.get("id")}
-
     def get_transactions(
         self,
         account_id: Optional[str] = None,
@@ -193,7 +186,7 @@ class SureImporter:
         for tx in transactions:
             date = (tx.get("date") or "").strip()
             cents = abs(int(tx.get("signed_amount_cents") or tx.get("amount_cents") or 0))
-            name = normalize_name(tx.get("name") or "")
+            name = dedup_name(tx.get("name") or "")
             if date and cents:
                 keys.add((date, cents, name))
         return keys
@@ -201,7 +194,37 @@ class SureImporter:
     def split_rows(
         self, rows: List[dict], existing: List[dict]
     ) -> Tuple[List[dict], List[dict]]:
-        """Split converted CSV rows into (new_rows, duplicates) vs existing tx."""
+        """Split converted CSV rows into (new_rows, duplicates) vs existing tx.
+
+        Two layers: (1) exact (date, |amount|, whitespace-stripped NAME) keys,
+        (2) an email-anchor fallback — existing transactions carrying an
+        "Email ref:" note were created from Mandiri email notifications and
+        may have a different name than the statement row (e.g. 'DINA AYU
+        SYAHPITRI HASIB' vs the bank-truncated 'DINA AYU SYAHPITRI H'). If
+        enough email-created tx cover all statement rows for a (date, amount)
+        key, the rows are duplicates. The count guard keeps two same-day
+        same-amount payments (e.g. two -500.000 transfers) from being wrongly
+        collapsed.
+        """
+        email_anchor: Dict[Tuple[str, int], int] = {}
+        for tx in existing:
+            if "email ref:" in (tx.get("notes") or "").lower():
+                date = (tx.get("date") or "").strip()
+                cents = abs(int(tx.get("signed_amount_cents") or tx.get("amount_cents") or 0))
+                if date and cents:
+                    email_anchor[(date, cents)] = email_anchor.get((date, cents), 0) + 1
+
+        batch_count: Dict[Tuple[str, int], int] = {}
+        for row in rows:
+            date = str(row.get("date") or "").strip()
+            try:
+                amount = float(row.get("amount") or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if date and amount:
+                key = (date, amount_to_cents(amount))
+                batch_count[key] = batch_count.get(key, 0) + 1
+
         keys = self.existing_keys(existing)
         new_rows: List[dict] = []
         dupes: List[dict] = []
@@ -213,22 +236,13 @@ class SureImporter:
                 amount = 0.0
             if not date or amount == 0:
                 continue  # not importable; silently drop
-            key = (date, amount_to_cents(amount), normalize_name(row.get("name") or ""))
-            (dupes if key in keys else new_rows).append(row)
+            dc = (date, amount_to_cents(amount))
+            key = (date, amount_to_cents(amount), dedup_name(row.get("name") or ""))
+            email_dupe = (
+                dc in email_anchor and batch_count.get(dc, 0) <= email_anchor[dc]
+            )
+            (dupes if (key in keys or email_dupe) else new_rows).append(row)
         return new_rows, dupes
-
-    # -- Classification ---------------------------------------------------
-
-    @classmethod
-    def classify(cls, name: str) -> Optional[str]:
-        """Return the category name for a transaction name, or None."""
-        upper = normalize_name(name)
-        if not upper:
-            return None
-        for pattern, category in CATEGORY_RULES:
-            if re.search(pattern, upper):
-                return category
-        return None
 
     # -- Writes -----------------------------------------------------------
 
@@ -278,28 +292,30 @@ class SureImporter:
         rows = data.get("data", [])
         return rows if isinstance(rows, list) else []
 
-    def categorize_transactions(
-        self, transactions: List[dict], categories_by_name: Dict[str, str]
-    ) -> Tuple[int, List[str]]:
-        """PATCH categories for transactions whose name matches the taxonomy.
+    def apply_rules(
+        self, transactions: List[dict], timeout: int = 90, interval: int = 5
+    ) -> List[dict]:
+        """Have Sure categorize ``transactions`` with its own rules.
 
-        Returns (categorized_count, skipped_names_without_category).
+        Rules run only after a family sync, which ``POST /sync`` queues
+        (creating a transaction through the API does not). Polls until every
+        transaction has a category or ``timeout`` passes, then returns the
+        transactions as Sure now has them. Ones no rule matches stay without
+        a category.
         """
-        categorized = 0
-        skipped: List[str] = []
-        for tx in transactions:
-            category = self.classify(tx.get("name") or "")
-            if not category:
-                continue
-            category_id = categories_by_name.get(category)
-            if not category_id:
-                skipped.append(category)
-                continue
-            self._request(
-                "PATCH", f"/transactions/{tx['id']}", {"category_id": category_id}
-            )
-            categorized += 1
-        return categorized, skipped
+        if not transactions:
+            return transactions
+        self._request("POST", "/sync")
+        fresh = {tx["id"]: tx for tx in transactions}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(interval)
+            for tx_id, tx in fresh.items():
+                if not tx.get("category"):
+                    fresh[tx_id] = {**tx, **self._request("GET", f"/transactions/{tx_id}")}
+            if all(tx.get("category") for tx in fresh.values()):
+                break
+        return list(fresh.values())
 
     def delete_transactions(self, transaction_ids: List[str]) -> int:
         deleted = 0

@@ -33,7 +33,7 @@ class TestSureImporterDedup:
             {"date": "", "signed_amount_cents": 0, "name": "No date"},
         ]
         keys = SureImporter.existing_keys(tx)
-        assert ("2026-08-01", 15000000, "SHOPEE PAY") in keys
+        assert ("2026-08-01", 15000000, "SHOPEEPAY") in keys
         assert ("2026-08-02", 500000000, "SALARY") in keys
         # Empty date / zero amount rows are excluded from the key set.
         assert len(keys) == 2
@@ -63,29 +63,63 @@ class TestSureImporterDedup:
         assert new_rows == []
         assert len(dupes) == 1
 
+    def test_split_rows_whitespace_variant_name_match(self):
+        # Regression: old imports stored 'Pembayaran QRke ...' (newline stripped,
+        # no space) while the converter now keeps 'Pembayaran QR\\nke ...'. Both
+        # are the SAME transaction — dedup must catch it (2026-08-17 incident:
+        # 9 duplicates imported because 'QRke' vs 'QR KE' mismatched).
+        importer = SureImporter(api_key="test")
+        rows = [{
+            "date": "2025-09-12", "amount": "-150000.0",
+            "name": "Pembayaran QR\nke PPPSRS THE JARDIN APPARTE\n509125378058",
+        }]
+        existing = [{
+            "date": "2025-09-12", "signed_amount_cents": -15000000,
+            "name": "Pembayaran QRke PPPSRS THE JARDIN APPARTE509125378058",
+        }]
+        new_rows, dupes = importer.split_rows(rows, existing)
+        assert new_rows == []
+        assert len(dupes) == 1
 
-class TestSureImporterClassify:
-    @pytest.mark.parametrize(
-        "name,expected",
-        [
-            ("Pembayaran BPJS Kesehatan Keluarga", "Insurance"),
-            ("SALARY DEPOSIT", "Salary"),
-            ("TRF GAJI BULANAN", "Salary"),
-            ("Biaya transaksi bank 1000", "Fees"),
-            ("BIAYA ADMINISTRASI BULANAN", "Fees"),
-            ("SHOPEE PAY", "Shopping"),
-            ("Tokopedia - Pembayaran", "Shopping"),
-            ("SAMSAT KENDARAAN", "Taxes"),
-            ("TRAVELOKA HOTEL", "Travel"),
-            ("SEABANK TRANSFER", "Cash Out"),
-            ("BANK RAKYAT INDONESIA", "Loan Payments"),
-            ("MARUGAME BANDUNG", "Food & Drink"),
-            ("Indomaret", None),
-            ("", None),
-        ],
-    )
-    def test_classify(self, name, expected):
-        assert SureImporter.classify(name) == expected
+    def test_split_rows_email_anchor_fallback(self):
+        # Regression: email-created tx carry an "Email ref:" note and a
+        # different name than the statement row ('DINA AYU SYAHPITRI HASIB'
+        # vs the bank-truncated 'DINA AYU SYAHPITRI H'). The statement row
+        # must be treated as a duplicate (email automation 2026-08-17).
+        importer = SureImporter(api_key="test")
+        rows = [{
+            "date": "2026-08-13", "amount": "-1100000.0",
+            "name": "Transfer BI Fast Ke BCA DINA AYU SYAHPITRI H 613624578",
+        }]
+        existing = [{
+            "date": "2026-08-13", "signed_amount_cents": -110000000,
+            "name": "Transfer BI Fast Ke BCA DINA AYU SYAHPITRI HASIB 0613624578",
+            "notes": "Email ref: 20260813BMRIIDJA010O0224743457 (msgid)",
+        }]
+        new_rows, dupes = importer.split_rows(rows, existing)
+        assert new_rows == []
+        assert len(dupes) == 1
+
+    def test_split_rows_email_anchor_count_guard(self):
+        # Two same-day same-amount transfers (e.g. PAINO/SYAMSINAR -500.000)
+        # where only ONE was email-created: the second statement row is NOT a
+        # duplicate and must be imported.
+        importer = SureImporter(api_key="test")
+        rows = [
+            {"date": "2026-07-29", "amount": "-500000.0",
+             "name": "Transfer ke BANK MANDIRI PAINO 1050014083699"},
+            {"date": "2026-07-29", "amount": "-500000.0",
+             "name": "Transfer ke BANK MANDIRI SYAMSINAR 1050012558668"},
+        ]
+        existing = [{
+            "date": "2026-07-29", "signed_amount_cents": -50000000,
+            "name": "Transfer ke BANK MANDIRI PAINO 1050014083699",
+            "notes": "Email ref: 260729123 (msgid)",
+        }]
+        new_rows, dupes = importer.split_rows(rows, existing)
+        assert len(dupes) == 1  # PAINO covered by email anchor
+        assert len(new_rows) == 1
+        assert new_rows[0]["name"] == "Transfer ke BANK MANDIRI SYAMSINAR 1050012558668"
 
 
 class TestSureImporterApi:
@@ -93,36 +127,26 @@ class TestSureImporterApi:
         with pytest.raises(ValueError):
             SureImporter(api_key="")
 
-    def test_categorize_transactions_patches(self, monkeypatch):
+    def test_apply_rules_syncs_then_polls_until_categorized(self, monkeypatch):
         importer = SureImporter(api_key="test")
-        patched = []
+        calls = []
+        polls = {"tx1": 0}
 
         def fake_request(method, path, payload=None):
-            patched.append((method, path, payload))
+            calls.append((method, path))
+            if path == "/transactions/tx1":
+                polls["tx1"] += 1  # rules land on the second poll
+                return {"category": {"name": "Fees"}} if polls["tx1"] > 1 else {"category": None}
             return {}
 
         monkeypatch.setattr(importer, "_request", fake_request)
-        tx = [{"id": "tx1", "name": "BPJS KESEHATAN"}, {"id": "tx2", "name": "Unknown Merchant"}]
-        categories = {"Insurance": "cat-insurance"}
-        count, skipped = importer.categorize_transactions(tx, categories)
-        assert count == 1
-        assert skipped == []
-        assert patched == [("PATCH", "/transactions/tx1", {"category_id": "cat-insurance"})]
-
-    def test_categorize_skips_missing_category(self, monkeypatch):
-        importer = SureImporter(api_key="test")
-        patched = []
-
-        def fake_request(method, path, payload=None):
-            patched.append((method, path, payload))
-            return {}
-
-        monkeypatch.setattr(importer, "_request", fake_request)
-        tx = [{"id": "tx1", "name": "BPJS KESEHATAN"}]
-        count, skipped = importer.categorize_transactions(tx, {"Insurance": None})
-        assert count == 0
-        assert skipped == ["Insurance"]
-        assert patched == []
+        monkeypatch.setattr("src.sure_importer.time.sleep", lambda _: None)
+        tx = [{"id": "tx1", "name": "Biaya transfer"}, {"id": "tx2", "category": {"name": "Salary"}}]
+        result = importer.apply_rules(tx)
+        assert calls[0] == ("POST", "/sync")
+        assert calls.count(("GET", "/transactions/tx1")) == 2
+        assert ("GET", "/transactions/tx2") not in calls  # already categorized
+        assert [t["category"]["name"] for t in result] == ["Fees", "Salary"]
 
     def test_get_transactions_paginates(self, monkeypatch):
         importer = SureImporter(api_key="test")
@@ -140,3 +164,20 @@ class TestSureImporterApi:
         monkeypatch.setattr(importer, "_request", fake_request)
         result = importer.get_transactions(account_id="acc-1")
         assert [t["id"] for t in result] == ["a", "b"]
+
+    def test_display_name_flattens_multiline_names(self):
+        # Regression: Sure's backend strips embedded newlines without replacing
+        # them ('Pembayaran QR\nke X\n608...' -> 'Pembayaran QRke X608...'), so
+        # the pipeline must flatten multi-line names to single spaces first.
+        from src.sure_importer import display_name
+
+        assert (
+            display_name("Pembayaran QR\nke CAFFE EDELWIS\n608544838726")
+            == "Pembayaran QR ke CAFFE EDELWIS 608544838726"
+        )
+        assert (
+            display_name("Transfer BI Fast\nKe BSI\nNURMIATI QQ RADIFAH 7103833633")
+            == "Transfer BI Fast Ke BSI NURMIATI QQ RADIFAH 7103833633"
+        )
+        assert display_name("  Biaya transfer BI Fast  ") == "Biaya transfer BI Fast"
+        assert display_name("") == ""
