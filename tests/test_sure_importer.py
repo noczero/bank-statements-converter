@@ -122,75 +122,31 @@ class TestSureImporterDedup:
         assert new_rows[0]["name"] == "Transfer ke BANK MANDIRI SYAMSINAR 1050012558668"
 
 
-class TestSureImporterClassify:
-    @pytest.mark.parametrize(
-        "name,expected",
-        [
-            ("Pembayaran BPJS Kesehatan Keluarga", "Insurance"),
-            ("SALARY DEPOSIT", "Salary"),
-            ("TRF GAJI BULANAN", "Salary"),
-            ("Biaya transaksi bank 1000", "Fees"),
-            ("BIAYA ADMINISTRASI BULANAN", "Fees"),
-            ("SHOPEE PAY", "Shopping"),
-            ("Tokopedia - Pembayaran", "Shopping"),
-            ("SAMSAT KENDARAAN", "Taxes"),
-            ("TRAVELOKA HOTEL", "Travel"),
-            ("SEABANK TRANSFER", None),
-            ("Transfer BI Fast Ke SEABANK INDONESIA SHANTY AMELLYA", "Family"),
-            ("Transfer BI Fast Dari BSI PAINO", None),
-            ("Penarikan Tunai Tanpa Kartu di ATM BDG", "Cash Withdrawal"),
-            ("Biaya Penarikan Tunai di ATM LINK", "Fees"),
-            ("Pembayaran Danatopup 89508082277009251", "E-Wallet Top-up"),
-            ("Biaya transaksi bank Pembayaran Danatopup", "Fees"),
-            ("Pembayaran QR ke LONDRI DEWE", "Services"),
-            ("Pembayaran QR ke PPPSRS THE JARRDIN", "Housing"),
-            ("Pembayaran Biznet Prepaid", "Utilities"),
-            ("Pembayaran QR ke CHPL - MR.D.I.Y CIHAMPELA", "Shopping"),
-            ("BANK RAKYAT INDONESIA", "Loan Payments"),
-            ("MARUGAME BANDUNG", "Food & Drink"),
-            ("Indomaret", None),
-            ("", None),
-        ],
-    )
-    def test_classify(self, name, expected):
-        assert SureImporter.classify(name) == expected
-
-
 class TestSureImporterApi:
     def test_requires_api_key(self):
         with pytest.raises(ValueError):
             SureImporter(api_key="")
 
-    def test_categorize_transactions_patches(self, monkeypatch):
+    def test_apply_rules_syncs_then_polls_until_categorized(self, monkeypatch):
         importer = SureImporter(api_key="test")
-        patched = []
+        calls = []
+        polls = {"tx1": 0}
 
         def fake_request(method, path, payload=None):
-            patched.append((method, path, payload))
+            calls.append((method, path))
+            if path == "/transactions/tx1":
+                polls["tx1"] += 1  # rules land on the second poll
+                return {"category": {"name": "Fees"}} if polls["tx1"] > 1 else {"category": None}
             return {}
 
         monkeypatch.setattr(importer, "_request", fake_request)
-        tx = [{"id": "tx1", "name": "BPJS KESEHATAN"}, {"id": "tx2", "name": "Unknown Merchant"}]
-        categories = {"Insurance": "cat-insurance"}
-        count, skipped = importer.categorize_transactions(tx, categories)
-        assert count == 1
-        assert skipped == []
-        assert patched == [("PATCH", "/transactions/tx1", {"category_id": "cat-insurance"})]
-
-    def test_categorize_skips_missing_category(self, monkeypatch):
-        importer = SureImporter(api_key="test")
-        patched = []
-
-        def fake_request(method, path, payload=None):
-            patched.append((method, path, payload))
-            return {}
-
-        monkeypatch.setattr(importer, "_request", fake_request)
-        tx = [{"id": "tx1", "name": "BPJS KESEHATAN"}]
-        count, skipped = importer.categorize_transactions(tx, {"Insurance": None})
-        assert count == 0
-        assert skipped == ["Insurance"]
-        assert patched == []
+        monkeypatch.setattr("src.sure_importer.time.sleep", lambda _: None)
+        tx = [{"id": "tx1", "name": "Biaya transfer"}, {"id": "tx2", "category": {"name": "Salary"}}]
+        result = importer.apply_rules(tx)
+        assert calls[0] == ("POST", "/sync")
+        assert calls.count(("GET", "/transactions/tx1")) == 2
+        assert ("GET", "/transactions/tx2") not in calls  # already categorized
+        assert [t["category"]["name"] for t in result] == ["Fees", "Salary"]
 
     def test_get_transactions_paginates(self, monkeypatch):
         importer = SureImporter(api_key="test")

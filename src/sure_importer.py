@@ -6,8 +6,8 @@ Wraps the Sure REST API (https://finance.zeroinside.id/api/v1):
     (``POST /imports`` with ``type=TransactionImport`` + ``account_id`` +
     ``raw_file_content`` + column configuration + ``publish=true``). The import
     job runs async on the server; ``wait_import`` polls until terminal.
-2.  ``categorize_transactions`` -> PATCHes categories using a regex taxonomy
-    on the transaction name (bank fees, BPJS, Shopee, ...).
+2.  ``apply_rules`` -> queues a family sync so Sure's own rules categorize
+    new transactions (the keyword rules live in Sure, not here).
 
 Auth: header ``X-Api-Key`` (NOT Bearer). A browser User-Agent is required or
 the server returns 403.
@@ -27,29 +27,6 @@ DEFAULT_BASE_URL = "https://finance.zeroinside.id/api/v1"
 USER_AGENT = "bank-statements-converter/1.0 (sure-import)"
 POLL_INTERVAL_S = 4
 POLL_TIMEOUT_S = 300
-
-# Category classification taxonomy — regexes matched against the UPPERCASED
-# transaction name. Order matters: bank-fee patterns first, then merchants.
-CATEGORY_RULES: List[Tuple[str, str]] = [
-    (r"\bBIAYA\b", "Fees"),
-    (r"BPJS KESEHATAN", "Insurance"),
-    (r"SALARY|GAJI", "Salary"),
-    (r"SAMSAT", "Taxes"),
-    (r"MESJID|QURBAN|ZAKAT|MASJID", "Gifts & Donations"),
-    (r"TRAVELOKA", "Travel"),
-    # Outgoing transfers to family; incoming ones ("... DARI ...") are excluded.
-    (r"^(?!.*\bDARI\b).*(SHANTY AMELLYA|ZELIKA ARGYANTI|PAINO|SYAMSINAR)", "Family"),
-    (r"PENARIKAN TUNAI", "Cash Withdrawal"),
-    (r"DANATOPUP", "E-Wallet Top-up"),
-    (r"LAUNDRY|LONDRI", "Services"),
-    (r"PPPSRS", "Housing"),
-    (r"BIZNET|TELKOMSEL", "Utilities"),
-    (r"MR\.?\s?D\.?I\.?Y", "Shopping"),
-    (r"BANK RAKYAT INDONESIA", "Loan Payments"),
-    (r"SHOPEE|TOKOPEDIA", "Shopping"),
-    (r"SHOES AND CARE|RING SHOES CARE", "Shopping"),
-    (r"MARUGAME", "Food & Drink"),
-]
 
 # Mandiri bank statements carry 3rd-party info in the second row of each
 # transaction (e.g. "From: Company ABC"). The converter already drops those.
@@ -171,18 +148,6 @@ class SureImporter:
         )
         return accounts if isinstance(accounts, list) else []
 
-    def get_categories(self) -> Dict[str, str]:
-        """Return {category_name: uuid} from /categories."""
-        data = self._request("GET", "/categories")
-        items = (
-            data.get("categories")
-            or data.get("data")
-            or (data if isinstance(data, list) else [])
-        )
-        if not isinstance(items, list):
-            return {}
-        return {c.get("name"): c.get("id") for c in items if c.get("id")}
-
     def get_transactions(
         self,
         account_id: Optional[str] = None,
@@ -279,19 +244,6 @@ class SureImporter:
             (dupes if (key in keys or email_dupe) else new_rows).append(row)
         return new_rows, dupes
 
-    # -- Classification ---------------------------------------------------
-
-    @classmethod
-    def classify(cls, name: str) -> Optional[str]:
-        """Return the category name for a transaction name, or None."""
-        upper = normalize_name(name)
-        if not upper:
-            return None
-        for pattern, category in CATEGORY_RULES:
-            if re.search(pattern, upper):
-                return category
-        return None
-
     # -- Writes -----------------------------------------------------------
 
     def create_import(
@@ -340,28 +292,30 @@ class SureImporter:
         rows = data.get("data", [])
         return rows if isinstance(rows, list) else []
 
-    def categorize_transactions(
-        self, transactions: List[dict], categories_by_name: Dict[str, str]
-    ) -> Tuple[int, List[str]]:
-        """PATCH categories for transactions whose name matches the taxonomy.
+    def apply_rules(
+        self, transactions: List[dict], timeout: int = 90, interval: int = 5
+    ) -> List[dict]:
+        """Have Sure categorize ``transactions`` with its own rules.
 
-        Returns (categorized_count, skipped_names_without_category).
+        Rules run only after a family sync, which ``POST /sync`` queues
+        (creating a transaction through the API does not). Polls until every
+        transaction has a category or ``timeout`` passes, then returns the
+        transactions as Sure now has them. Ones no rule matches stay without
+        a category.
         """
-        categorized = 0
-        skipped: List[str] = []
-        for tx in transactions:
-            category = self.classify(tx.get("name") or "")
-            if not category:
-                continue
-            category_id = categories_by_name.get(category)
-            if not category_id:
-                skipped.append(category)
-                continue
-            self._request(
-                "PATCH", f"/transactions/{tx['id']}", {"category_id": category_id}
-            )
-            categorized += 1
-        return categorized, skipped
+        if not transactions:
+            return transactions
+        self._request("POST", "/sync")
+        fresh = {tx["id"]: tx for tx in transactions}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(interval)
+            for tx_id, tx in fresh.items():
+                if not tx.get("category"):
+                    fresh[tx_id] = {**tx, **self._request("GET", f"/transactions/{tx_id}")}
+            if all(tx.get("category") for tx in fresh.values()):
+                break
+        return list(fresh.values())
 
     def delete_transactions(self, transaction_ids: List[str]) -> int:
         deleted = 0

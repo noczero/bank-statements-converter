@@ -18,9 +18,6 @@ Examples:
     # Preview only (no writes to Sure)
     python sure_import_statement.py bank-statements/mandiri/statement.xlsx --dry-run
 
-    # Convert + import + auto-categorize using the known taxonomy
-    python sure_import_statement.py bank-statements/mandiri/statement.xlsx --categorize
-
     # Import without auto-publishing (reviewable in the app, then publish)
     python sure_import_statement.py statement.xlsx --no-publish
 """
@@ -94,7 +91,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("statement", help="Path to the Mandiri .xlsx bank statement")
     parser.add_argument("--dry-run", action="store_true", help="Convert + dedup only, no API writes")
     parser.add_argument("--no-publish", action="store_true", help="Create the import but don't publish")
-    parser.add_argument("--categorize", action="store_true", help="Auto-categorize imported tx (taxonomy)")
     parser.add_argument("--account", default="Mandiri", help="Sure account name to import into (default: Mandiri)")
     parser.add_argument("--password", default=None, help="Excel password (overrides env)")
     parser.add_argument("--api-key", default=None, help="Sure API key (overrides env)")
@@ -187,33 +183,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  rows imported={created} invalid={invalid}")
     print(f"\nDone. {len(new_rows)} statement row(s) imported into Sure ({args.account}).")
     print(f"Import record: https://finance.zeroinside.id/imports/{import_id}")
-
-    # 5. Optional categorization --------------------------------------------
-    if args.categorize and new_rows:
-        print("\nCategorizing imported transactions ...")
-        # Match back the created transactions by dedup key (date, cents, name).
-        keys = {
-            (r["date"].strip(), int(round(abs(float(r["amount"])) * 100)),
-             (r["name"] or "").strip().upper())
-            for r in new_rows
-        }
-        fresh = importer.get_transactions(
-            account_id=account_id, start_date=start_date, end_date=end_date
-        )
-        created_tx = [tx for tx in fresh if _tx_key(tx) in keys]
-        categories = importer.get_categories()
-        count, skipped = importer.categorize_transactions(created_tx, categories)
-        print(f"  categorized {count} transaction(s)")
-        for name in skipped:
-            print(f"  WARN: category '{name}' not found in Sure — skipped")
+    print("Sure's rules categorize the new rows after the import's sync.")
     return 0
-
-
-def _tx_key(tx: dict):
-    date = (tx.get("date") or "").strip()
-    cents = abs(int(tx.get("signed_amount_cents") or tx.get("amount_cents") or 0))
-    name = (tx.get("name") or "").strip().upper()
-    return (date, cents, name)
 
 
 def _to_csv(rows: List[dict]) -> str:
