@@ -31,13 +31,20 @@ POLL_TIMEOUT_S = 300
 # Category classification taxonomy — regexes matched against the UPPERCASED
 # transaction name. Order matters: bank-fee patterns first, then merchants.
 CATEGORY_RULES: List[Tuple[str, str]] = [
-    (r"BIAYA TRANSAKSI BANK|BIAYA ADMINISTRASI|BIAYA TRANSFER", "Fees"),
+    (r"\bBIAYA\b", "Fees"),
     (r"BPJS KESEHATAN", "Insurance"),
     (r"SALARY|GAJI", "Salary"),
     (r"SAMSAT", "Taxes"),
     (r"MESJID|QURBAN|ZAKAT|MASJID", "Gifts & Donations"),
     (r"TRAVELOKA", "Travel"),
-    (r"SEABANK|SAQU INDONESIA", "Cash Out"),
+    # Outgoing transfers to family; incoming ones ("... DARI ...") are excluded.
+    (r"^(?!.*\bDARI\b).*(SHANTY AMELLYA|ZELIKA ARGYANTI|PAINO|SYAMSINAR)", "Family"),
+    (r"PENARIKAN TUNAI", "Cash Withdrawal"),
+    (r"DANATOPUP", "E-Wallet Top-up"),
+    (r"LAUNDRY|LONDRI", "Services"),
+    (r"PPPSRS", "Housing"),
+    (r"BIZNET|TELKOMSEL", "Utilities"),
+    (r"MR\.?\s?D\.?I\.?Y", "Shopping"),
     (r"BANK RAKYAT INDONESIA", "Loan Payments"),
     (r"SHOPEE|TOKOPEDIA", "Shopping"),
     (r"SHOES AND CARE|RING SHOES CARE", "Shopping"),
