@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a Mandiri bank statement (.xlsx) and import it into Sure Finance.
+"""Convert a Mandiri bank statement (.xlsx or .pdf) and import it into Sure Finance.
 
 Pipeline:
     1. Convert the (optionally password-protected) Excel statement to CSV
@@ -33,6 +33,7 @@ from typing import List, Optional
 import pandas as pd
 from dotenv import load_dotenv
 
+from src import mandiri_pdf_statement
 from src.mandiri_bank_statement_converter import MandiriBankStatementConverter
 from src.sure_importer import (
     DEFAULT_BASE_URL,
@@ -88,11 +89,11 @@ def pick_account(importer: SureImporter, name: str) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("statement", help="Path to the Mandiri .xlsx bank statement")
+    parser.add_argument("statement", help="Path to the Mandiri .xlsx or .pdf bank statement")
     parser.add_argument("--dry-run", action="store_true", help="Convert + dedup only, no API writes")
     parser.add_argument("--no-publish", action="store_true", help="Create the import but don't publish")
     parser.add_argument("--account", default="Mandiri", help="Sure account name to import into (default: Mandiri)")
-    parser.add_argument("--password", default=None, help="Excel password (overrides env)")
+    parser.add_argument("--password", default=None, help="Excel/PDF password (overrides env)")
     parser.add_argument("--api-key", default=None, help="Sure API key (overrides env)")
     parser.add_argument("--base-url", default=os.getenv("SURE_BASE_URL", DEFAULT_BASE_URL))
     args = parser.parse_args(argv)
@@ -105,7 +106,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 1. Convert ----------------------------------------------------------
     print(f"[1/4] Converting {args.statement} ...")
     converter = MandiriBankStatementConverter(password=args.password)
-    output_path = converter.convert_file(args.statement)
+    if args.statement.lower().endswith(".pdf"):
+        output_path = mandiri_pdf_statement.convert(
+            args.statement, converter.results_folder,
+            args.password or os.getenv("MANDIRI_BANK_STATEMENT_PASSWORD"),
+        )
+    else:
+        output_path = converter.convert_file(args.statement)
     if not output_path:
         print("  (already converted — reusing existing CSV)")
         output_path = os.path.join(

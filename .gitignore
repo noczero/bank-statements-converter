@@ -22,3 +22,4 @@ wheels/
 
 # Results files
 results/*.csv
+*.eml
